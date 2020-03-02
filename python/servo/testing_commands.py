@@ -442,7 +442,6 @@ class MachCommands(CommandBase):
     # Helper for test_css and test_wpt:
     def wptrunner(self, run_file, **kwargs):
         self.set_software_rendering_env(kwargs['release'], kwargs['debugger'])
-
         # By default, Rayon selects the number of worker threads
         # based on the available CPU count. This doesn't work very
         # well when running tests on CI, since we run so many
@@ -450,6 +449,9 @@ class MachCommands(CommandBase):
         # extra timeouts. Instead, force Rayon to assume we are
         # running on a 2 CPU environment.
         os.environ['RAYON_RS_NUM_CPUS'] = "2"
+
+        # TODO: allow running WPT with a GPU
+        os.environ["RUST_BACKTRACE"] = "1"
 
         os.environ["RUST_BACKTRACE"] = "1"
         kwargs["debug"] = not kwargs["release"]

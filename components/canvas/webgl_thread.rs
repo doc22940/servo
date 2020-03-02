@@ -60,12 +60,12 @@ use std::slice;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use surfman;
-use surfman::platform::generic::universal::adapter::Adapter;
-use surfman::platform::generic::universal::connection::Connection;
-use surfman::platform::generic::universal::context::Context;
-use surfman::platform::generic::universal::device::Device;
+use surfman::Adapter;
+use surfman::Connection;
+use surfman::Context;
 use surfman::ContextAttributeFlags;
 use surfman::ContextAttributes;
+use surfman::Device;
 use surfman::GLVersion;
 use surfman::SurfaceAccess;
 use surfman::SurfaceInfo;
@@ -87,6 +87,7 @@ struct GLContextData {
     attributes: GLContextAttributes,
 }
 
+#[derive(Debug)]
 pub struct GLState {
     webgl_version: WebGLVersion,
     gl_version: GLVersion,
@@ -142,9 +143,9 @@ pub(crate) struct WebGLThread {
     /// The receiver that should be used to send WebGL messages for processing.
     sender: WebGLSender<WebGLMsg>,
     /// The swap chains used by webrender
-    webrender_swap_chains: SwapChains<WebGLContextId>,
+    webrender_swap_chains: SwapChains<WebGLContextId, Device>,
     /// The swap chains used by webxr
-    webxr_swap_chains: SwapChains<WebXRSwapChainId>,
+    webxr_swap_chains: SwapChains<WebXRSwapChainId, Device>,
     /// Whether this context is a GL or GLES context.
     api_type: gl::GlType,
 }
@@ -162,8 +163,8 @@ pub(crate) struct WebGLThreadInit {
     pub external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
     pub sender: WebGLSender<WebGLMsg>,
     pub receiver: WebGLReceiver<WebGLMsg>,
-    pub webrender_swap_chains: SwapChains<WebGLContextId>,
-    pub webxr_swap_chains: SwapChains<WebXRSwapChainId>,
+    pub webrender_swap_chains: SwapChains<WebGLContextId, Device>,
+    pub webxr_swap_chains: SwapChains<WebXRSwapChainId, Device>,
     pub connection: Connection,
     pub adapter: Adapter,
     pub api_type: gl::GlType,
@@ -220,7 +221,9 @@ impl WebGLThread {
         }: WebGLThreadInit,
     ) -> Self {
         WebGLThread {
-            device: Device::new(&connection, &adapter).expect("Couldn't open WebGL device!"),
+            device: connection
+                .create_device(&adapter)
+                .expect("Couldn't open WebGL device!"),
             webrender_api: webrender_api_sender.create_api(),
             contexts: Default::default(),
             cached_context_info: Default::default(),
@@ -419,21 +422,24 @@ impl WebGLThread {
         requested_size: Size2D<u32>,
         attributes: GLContextAttributes,
     ) -> Result<(WebGLContextId, webgl::GLLimits), String> {
-        debug!("WebGLThread::create_webgl_context({:?})", requested_size);
+        debug!(
+            "WebGLThread::create_webgl_context({:?}, {:?}, {:?})",
+            webgl_version, requested_size, attributes
+        );
 
         // Creating a new GLContext may make the current bound context_id dirty.
         // Clear it to ensure that  make_current() is called in subsequent commands.
         self.bound_context_id = None;
 
         let context_attributes = &ContextAttributes {
-            version: webgl_version.to_surfman_version(),
-            flags: attributes.to_surfman_context_attribute_flags(webgl_version),
+            version: webgl_version.to_surfman_version(self.api_type),
+            flags: attributes.to_surfman_context_attribute_flags(webgl_version, self.api_type),
         };
 
         let context_descriptor = self
             .device
             .create_context_descriptor(&context_attributes)
-            .unwrap();
+            .expect("Failed to create context descriptor");
 
         let safe_size = Size2D::new(
             requested_size.width.min(SAFE_VIEWPORT_DIMS[0]).max(1),
@@ -450,7 +456,7 @@ impl WebGLThread {
             .expect("Failed to create the GL context!");
         let surface = self
             .device
-            .create_surface(&ctx, surface_access, &surface_type)
+            .create_surface(&ctx, surface_access, surface_type)
             .expect("Failed to create the initial surface!");
         self.device
             .bind_surface_to_context(&mut ctx, surface)
@@ -480,7 +486,7 @@ impl WebGLThread {
         debug!(
             "Created webgl context {:?}/{:?}",
             id,
-            self.device.context_id(&ctx)
+            self.device.context_id(&ctx),
         );
 
         let gl = match self.api_type {
@@ -544,6 +550,7 @@ impl WebGLThread {
             default_vao,
             ..Default::default()
         };
+        debug!("Created state {:?}", state);
         self.contexts.insert(
             id,
             GLContextData {
@@ -2160,6 +2167,7 @@ impl WebGLImpl {
                 &mut transform_feedback_mode,
             );
         }
+
         ProgramLinkInfo {
             linked: true,
             active_attribs,
@@ -2375,8 +2383,8 @@ impl WebGLImpl {
     /// Updates the swap buffers if the context surface needs to be changed
     fn attach_surface(
         context_id: WebGLContextId,
-        webrender_swap_chains: &SwapChains<WebGLContextId>,
-        webxr_swap_chains: &SwapChains<WebXRSwapChainId>,
+        webrender_swap_chains: &SwapChains<WebGLContextId, Device>,
+        webxr_swap_chains: &SwapChains<WebXRSwapChainId, Device>,
         request: WebGLFramebufferBindingRequest,
         ctx: &mut Context,
         device: &mut Device,
@@ -2846,11 +2854,14 @@ fn clamp_viewport(gl: &Gl, size: Size2D<u32>) -> Size2D<u32> {
 }
 
 trait ToSurfmanVersion {
-    fn to_surfman_version(self) -> GLVersion;
+    fn to_surfman_version(self, api_type: gl::GlType) -> GLVersion;
 }
 
 impl ToSurfmanVersion for WebGLVersion {
-    fn to_surfman_version(self) -> GLVersion {
+    fn to_surfman_version(self, api_type: gl::GlType) -> GLVersion {
+        if api_type == gl::GlType::Gles {
+            return GLVersion::new(3, 0);
+        }
         match self {
             WebGLVersion::WebGL1 => GLVersion::new(2, 0),
             WebGLVersion::WebGL2 => GLVersion::new(3, 0),
@@ -2862,6 +2873,7 @@ trait SurfmanContextAttributeFlagsConvert {
     fn to_surfman_context_attribute_flags(
         &self,
         webgl_version: WebGLVersion,
+        api_type: gl::GlType,
     ) -> ContextAttributeFlags;
 }
 
@@ -2869,12 +2881,13 @@ impl SurfmanContextAttributeFlagsConvert for GLContextAttributes {
     fn to_surfman_context_attribute_flags(
         &self,
         webgl_version: WebGLVersion,
+        api_type: gl::GlType,
     ) -> ContextAttributeFlags {
         let mut flags = ContextAttributeFlags::empty();
         flags.set(ContextAttributeFlags::ALPHA, self.alpha);
         flags.set(ContextAttributeFlags::DEPTH, self.depth);
         flags.set(ContextAttributeFlags::STENCIL, self.stencil);
-        if webgl_version == WebGLVersion::WebGL1 {
+        if (webgl_version == WebGLVersion::WebGL1) && (api_type == gl::GlType::Gl) {
             flags.set(ContextAttributeFlags::COMPATIBILITY_PROFILE, true);
         }
         flags
